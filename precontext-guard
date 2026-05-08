@@ -275,10 +275,28 @@ def log_event(kind: str, cmd: str, reason: str = "") -> None:
     ``cat <redacted:/.aws/credentials>``.  This prevents the audit trail
     itself from leaking the layout of your filesystem if it gets
     accidentally committed or shared.
+
+    Permissions: ``LOG_DIR`` is forced to 0o700 (owner only) and
+    ``LOG_FILE`` is opened with explicit mode 0o600.  This closes the
+    secret-literal-in-audit-row leak path identified in the 2026-05-09
+    R17 audit (CRITICAL #2): a blocked command line can legitimately
+    contain a hard-coded credential, and writing it to a 0o644 file
+    would expose it to every other local user.
     """
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as fp:
+        try:
+            os.chmod(LOG_DIR, 0o700)
+        except OSError:
+            pass
+        # O_NOFOLLOW protects against a symlink swap before we open.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(LOG_FILE), flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "a", encoding="utf-8") as fp:
             fp.write(
                 json.dumps(
                     {
@@ -367,25 +385,177 @@ def load_external_rules(
     return allow, deny
 
 
+def split_segments(cmd: str) -> list[str]:
+    """Split a shell command at top-level statement separators.
+
+    Recognised separators (top level only — separators inside single or
+    double quotes, or escaped with a backslash, do not split):
+
+    * ``;``  — sequential, status ignored
+    * ``&&`` — sequential, run-on-success
+    * ``||`` — sequential, run-on-failure
+    * ``|``  — pipe (both ends execute)
+    * ``\\n`` — newline (multi-line bash blocks)
+    * ``&``  — background (the running statement still counts)
+
+    Returns at least one segment for any non-empty input. Empty / pure
+    whitespace input yields an empty list.
+
+    This is the core fix for the 2026-05-09 R17 critic finding
+    CRITICAL #1: previously a command like
+    ``rm -rf /tmp/x; cat .env`` short-circuited on the harmless ``rm``
+    prefix matching an allow rule, so the second statement was never
+    evaluated. With per-segment scanning each statement must clear the
+    deny rules independently.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    in_single = False
+    in_double = False
+    prev_escape = False
+    n = len(cmd)
+    i = 0
+    while i < n:
+        c = cmd[i]
+        if prev_escape:
+            buf.append(c)
+            prev_escape = False
+            i += 1
+            continue
+        if c == "\\" and not in_single:
+            buf.append(c)
+            prev_escape = True
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            buf.append(c)
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            buf.append(c)
+            i += 1
+            continue
+        if in_single or in_double:
+            buf.append(c)
+            i += 1
+            continue
+        # Top-level separators below.
+        if c in (";", "\n"):
+            seg = "".join(buf).strip()
+            if seg:
+                out.append(seg)
+            buf = []
+            i += 1
+            continue
+        if c == "|" and i + 1 < n and cmd[i + 1] == "|":
+            seg = "".join(buf).strip()
+            if seg:
+                out.append(seg)
+            buf = []
+            i += 2
+            continue
+        if c == "&" and i + 1 < n and cmd[i + 1] == "&":
+            seg = "".join(buf).strip()
+            if seg:
+                out.append(seg)
+            buf = []
+            i += 2
+            continue
+        if c == "|":
+            seg = "".join(buf).strip()
+            if seg:
+                out.append(seg)
+            buf = []
+            i += 1
+            continue
+        if c == "&":
+            # Background launcher — the preceding statement still counts.
+            seg = "".join(buf).strip()
+            if seg:
+                out.append(seg)
+            buf = []
+            i += 1
+            continue
+        buf.append(c)
+        i += 1
+    seg = "".join(buf).strip()
+    if seg:
+        out.append(seg)
+    return out
+
+
+def _decide_segment(
+    segment: str,
+    allow_pats: list[re.Pattern[str]],
+    deny_pats: list[tuple[str, str]],
+) -> tuple[str, str]:
+    """Evaluate one statement against allow/deny rule sets."""
+    for pat in allow_pats:
+        if pat.search(segment):
+            return "allow", f"matched allow: {pat.pattern}"
+    for pat_str, reason in deny_pats:
+        try:
+            if re.search(pat_str, segment):
+                return "block", reason
+        except re.error:
+            log_event("rule-error", pat_str, "invalid regex; skipped")
+            continue
+    return "allow", "no rule hit (gray)"
+
+
 def decide(cmd: str) -> tuple[str, str]:
-    """Return (verdict, reason). verdict in {"allow", "block"}."""
+    """Return (verdict, reason). verdict in {"allow", "block"}.
+
+    Two-pass scan:
+
+    1. **Whole-command deny scan** — catches *structural* patterns where
+       the malicious shape spans a separator (e.g.
+       ``curl ... | sh``, where neither ``curl`` nor ``sh`` is denied
+       in isolation but the pipe-into-shell composition is). Allow rules
+       are *not* consulted here; whole-command allow short-circuit was
+       the v1 chain-bypass vulnerability that R17 critic CRITICAL #1
+       found.
+    2. **Per-segment scan** — splits at top-level ``;`` ``&&`` ``||``
+       ``|`` ``\\n`` ``&`` and evaluates each statement independently.
+       This blocks chains like ``rm -rf /tmp/x; cat .env`` where the
+       first segment matches an allow rule. A blocking segment blocks
+       the whole call.
+
+    The two scans are complementary: pass 1 sees composition the
+    splitter erases, pass 2 sees segments the wholestring scan would
+    short-circuit on.
+    """
+    segments = split_segments(cmd)
+    if not segments:
+        return "allow", "empty"
+
     allow_extra: list[str] = []
     deny_extra: list[tuple[str, str]] = []
     rules_path = os.environ.get("PCG_RULES_FILE")
     if rules_path and os.path.isfile(rules_path):
         allow_extra, deny_extra = load_external_rules(rules_path)
 
-    for pat in _compile([*allow_extra, *ALLOW_DEFAULT]):
-        if pat.search(cmd):
-            return "allow", f"matched allow: {pat.pattern}"
+    allow_pats = _compile([*allow_extra, *ALLOW_DEFAULT])
+    deny_pats: list[tuple[str, str]] = [*deny_extra, *DENY_DEFAULT]
 
-    for pat_str, reason in [*deny_extra, *DENY_DEFAULT]:
+    # Pass 1: whole-string deny scan (structural compositions like
+    # `curl ... | sh` that the splitter would atomise).
+    for pat_str, reason in deny_pats:
         try:
             if re.search(pat_str, cmd):
                 return "block", reason
         except re.error:
             log_event("rule-error", pat_str, "invalid regex; skipped")
             continue
+
+    # Pass 2: per-segment scan (chain-bypass close).
+    for segment in segments:
+        verdict, reason = _decide_segment(segment, allow_pats, deny_pats)
+        if verdict == "block":
+            preview = segment if len(segment) <= 80 else segment[:77] + "..."
+            return "block", f"segment '{preview}': {reason}"
 
     return "allow", "no rule hit (gray)"
 
@@ -407,7 +577,26 @@ def main(argv: list[str] | None = None) -> int:
     if sys.stdin.isatty():
         # No JSON piped in — defer.
         return 0
-    raw = sys.stdin.read()
+
+    # CRITICAL #3 fix (2026-05-09 R17 audit) — fail-secure stdin cap.
+    #
+    # Previously stdin was read without a size limit, so a 1MB junk
+    # payload could push the regex engine into pathological backtracking,
+    # bubble up an internal error, and ride the documented "fail-open"
+    # policy to bypass every deny rule. We now cap at 1 MiB and BLOCK
+    # (not approve) on overflow — a real Claude Code PreToolUse payload
+    # is well under 64 KiB.
+    max_stdin = 1 << 20  # 1 MiB
+    raw = sys.stdin.read(max_stdin + 1)
+    if len(raw) > max_stdin:
+        log_event("block", raw[:200], "stdin > 1 MiB (fail-secure)")
+        sys.stderr.write(
+            "[precontext-guard] BLOCKED — stdin payload exceeded "
+            f"{max_stdin} bytes (fail-secure). This is well above any "
+            "real Claude Code PreToolUse payload and is treated as a "
+            "regex-exhaustion attack rather than legitimate input.\n"
+        )
+        return 2
     if not raw.strip():
         return 0
 
