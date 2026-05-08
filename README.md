@@ -20,7 +20,7 @@ prompt.  `precontext-guard` stops it earlier, at the moment the assistant
 asks the runtime to execute the command.
 
 Read more about why this layer matters in
-[docs/threat-model.md](docs/threat-model.md) (TODO).
+[docs/threat-model.md](docs/threat-model.md).
 
 ---
 
@@ -113,14 +113,49 @@ before deny rules; the first match in each stage wins.
 
 ## How it differs from related tools
 
-| Tool                       | When it runs           | What it inspects                | This stops a secret from… |
-| -------------------------- | ---------------------- | ------------------------------- | -------------------------- |
-| `precontext-guard` (this)  | **Before** Bash exec   | The command string itself       | … entering the assistant's context window in the first place. |
-| `gitleaks`, `trufflehog`   | After commit / on push | Git tree, commits, history      | … leaving your repo. |
-| `pre-commit` secret hooks  | At `git commit`        | Staged diff                     | … getting committed. |
-| Anthropic `permissions.deny` (built-in) | Before tool exec | Exact command match | (similar layer, but exact-match — `precontext-guard` is regex with reasons.) |
+| Tool                                    | When                  | What it inspects             | This stops a secret from… |
+| --------------------------------------- | --------------------- | ---------------------------- | -------------------------- |
+| `precontext-guard` (this)               | **Before** Bash exec  | The command string (regex)   | … *entering* the assistant's context window. |
+| Anthropic `permissions.deny` (built-in) | Before tool exec      | Glob-prefix match            | … running specific *prefixes*. Glob-only — no regex, no reason text, no audit log. |
+| `gitleaks`, `trufflehog`                | After commit / push   | Git tree, commits, history   | … leaving your repo. |
+| `pre-commit` secret hooks               | At `git commit`       | Staged diff                  | … getting committed. |
 
-These are complementary.  Run them together.
+These are **complementary** layers — run them together.
+
+### Specifically vs. Anthropic's built-in `permissions.deny`
+
+The built-in `permissions.deny` lets you write rules like
+`Bash(gh auth token*)` and is enforced natively by Claude Code with no
+extra process.  Use it first.  `precontext-guard` adds the things the
+built-in can't do today:
+
+- **Regex anywhere in the command**, not just a prefix glob — so
+  `echo $GITHUB_TOKEN` and `echo "$GH_PAT"` are both caught.
+- **A `reason` string** explaining *why* the command was blocked and
+  *what to type instead* (the built-in just silently denies).
+- **A path-redacted JSONL audit log** (`~/.local/state/precontext-guard/audit.jsonl`)
+  that records every decision without leaking the *paths* of the
+  credential files it blocked.
+- **One-shot bypass** via `PCG_OVERRIDE=1` so the assistant can recover
+  from a false positive without you editing settings.json.
+
+If your threat model is fully covered by `Bash(<prefix>*)` rules, you
+may not need this OSS at all — that's a healthy outcome and the README
+above includes a worked example of how to express the most common
+deny rules in `permissions.deny`.
+
+### Specifically vs. `claude-safety-guard`
+
+`claude-safety-guard` (a sibling project) is also a `PreToolUse` hook,
+but its focus is **filesystem destruction** (`rm -rf /`,
+`git push --force`, `mkfs.*`, fork bombs, `git reset --hard origin/*`).
+`precontext-guard`'s focus is **secret literals reaching the model's
+context** (`gh auth token`, `cat .env`, `printenv`, `vault read`,
+`op --reveal`, `gpg --decrypt`, `gcloud auth print-*-token`).
+
+The two overlap on a handful of stdlib commands (`cat .env`,
+`curl|sh`, `printenv`) but otherwise look at the *category* of
+"what could go wrong" through different lenses.  Run both.
 
 ---
 
@@ -142,6 +177,8 @@ The shipped rule set covers the common offenders:
   `secret-tool lookup`, `keyring get`
 - **Crypto leakage**: `gpg --decrypt`, `openssl … -passin pass:`
 - **Shell history**: `history`, `fc -l`
+- **Inline-shell bypasses**: `bash -c '...'`, `sh -c '...'`, `eval '...'`
+  (these would otherwise be a single-line escape from every other rule)
 
 The full list lives in `precontext-guard` itself (one Python file — read it
 top-to-bottom in five minutes).
@@ -154,8 +191,10 @@ top-to-bottom in five minutes).
 python -m pytest tests/ -q
 ```
 
-108 unit tests cover the matcher.  CI also runs the hook end-to-end with
-synthetic JSON payloads.
+25 test functions, expanded by `pytest.mark.parametrize` to ~120
+parameterised cases, cover the matcher and the audit log.  CI also runs
+the hook end-to-end with synthetic JSON payloads, validates the bundled
+JSON examples, and exercises the documented `jq` merge for idempotency.
 
 ---
 
