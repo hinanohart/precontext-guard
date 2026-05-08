@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (2026-05-09 R17 audit — three CRITICAL classes patched)
+
+- **Chained-command bypass closed (CRITICAL #1).** Previously a command
+  like `git push && cat .env` short-circuited on the leading allow-rule
+  match and approved the whole call, leaving the chained `cat .env`
+  unevaluated. The decider now splits at top-level shell separators
+  (`;`, `&&`, `||`, `|`, `\n`, `&`) — quote- and escape-aware — and
+  evaluates each statement independently. A whole-string deny pass is
+  also retained so structural patterns like `curl ... | sh` are still
+  caught.
+- **Audit log permissions hardened (CRITICAL #2).** Blocked-command
+  rows can legitimately contain hard-coded credential literals; writing
+  them to a 0o644 file leaked them to every other local user. The audit
+  file is now opened with explicit mode 0o600 (and `O_NOFOLLOW`), and
+  the parent directory is forced to 0o700 on creation.
+- **Stdin cap + fail-secure (CRITICAL #3).** Stdin had no size limit and
+  any internal error escalated to "fail-open: tool call proceeds", so a
+  ~1 MiB junk payload could exhaust the regex engine and bypass every
+  deny rule. Reads are now capped at 1 MiB and overflow returns a
+  hook-Block (rc=2) with a stable `fail-secure` reason; this is well
+  above any real Claude Code PreToolUse payload.
+
 ### Added
 - **Inline-shell bypass deny** (`bash -c`, `sh -c`, `zsh -c`, `fish -c`,
   `dash -c`, `eval`).  Without these, every other deny pattern could be
