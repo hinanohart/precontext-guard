@@ -41,6 +41,14 @@ pg = _load_module()
 @pytest.mark.parametrize(
     "cmd",
     [
+        # Inline-shell bypasses (must be blocked, otherwise they erase
+        # every other deny pattern).
+        "bash -c 'cat .env'",
+        "bash -c \"cat .env\"",
+        "sh -c 'gh auth token'",
+        "zsh -c 'echo $GITHUB_TOKEN'",
+        "eval 'cat .env'",
+        # The literal CLI patterns.
         "gh auth token",
         "  gh auth token  ",
         "gh auth login --with-token",
@@ -309,6 +317,45 @@ def test_main_override_bypasses_block() -> None:
         env={"PCG_OVERRIDE": "1"},
     )
     assert code == 0
+
+
+def test_audit_log_redacts_credential_paths(tmp_path, monkeypatch) -> None:
+    """The audit log should never record the absolute path of a blocked
+    credential file — only its kind."""
+    log_dir = tmp_path / "audit"
+    monkeypatch.setattr(pg, "LOG_DIR", log_dir)
+    monkeypatch.setattr(pg, "LOG_FILE", log_dir / "audit.jsonl")
+
+    pg.log_event(
+        "block",
+        "cat /home/alice/.aws/credentials",
+        reason="creds",
+    )
+    pg.log_event(
+        "block",
+        "cat /opt/secrets/.env",
+        reason="env",
+    )
+    pg.log_event(
+        "block",
+        "head id_ed25519",
+        reason="key",
+    )
+
+    contents = (log_dir / "audit.jsonl").read_text(encoding="utf-8")
+    # The actual paths must NOT appear.
+    assert "/home/alice" not in contents
+    assert "/opt/secrets" not in contents
+    # The redacted form must.
+    assert "<redacted:/.aws/credentials>" in contents
+    assert "<redacted:.env>" in contents
+    assert "<redacted:id_ed25519>" in contents
+
+
+def test_redact_for_log_returns_unchanged_for_non_path_commands() -> None:
+    assert pg._redact_for_log("gh auth token") == "gh auth token"
+    assert pg._redact_for_log("printenv") == "printenv"
+    assert pg._redact_for_log("echo $GITHUB_TOKEN") == "echo $GITHUB_TOKEN"
 
 
 def test_main_version_flag(capsys) -> None:

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Inline-shell bypass deny** (`bash -c`, `sh -c`, `zsh -c`, `fish -c`,
+  `dash -c`, `eval`).  Without these, every other deny pattern could be
+  trivially escaped by wrapping the command in `bash -c '...'`.
+- **Path-redacted audit log**.  A blocked `cat /home/alice/.aws/credentials`
+  now records as `cat <redacted:/.aws/credentials>` — the kind of file is
+  preserved, the absolute filesystem path is not. This prevents the
+  audit trail itself from leaking your home directory layout if it ever
+  gets accidentally shared.
+- README section explicitly comparing `precontext-guard` to
+  Anthropic's built-in `permissions.deny` and to `claude-safety-guard`,
+  so users can pick the right layer (or all three) instead of guessing.
+
 ### Changed
 - Replaced the previous JSONC `examples/settings.json.fragment` (which
   contained `//` comments) with a strict-JSON `examples/hooks.json`.

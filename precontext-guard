@@ -86,6 +86,17 @@ ALLOW_DEFAULT: list[str] = [
 
 DENY_DEFAULT: list[tuple[str, str]] = [
     (
+        r"\b(bash|sh|zsh|fish|dash)\s+-c\s+",
+        "Inline shell wrappers (bash -c, sh -c, ...) bypass the literal "
+        "deny patterns; run the underlying command directly so it can be "
+        "inspected, or use '!' prefix in your own shell.",
+    ),
+    (
+        r"\beval\s+",
+        "eval evaluates a constructed string and bypasses literal deny "
+        "patterns; restructure to call the command directly.",
+    ),
+    (
         r"\bgh\s+auth\s+(token|login\s+--with-token)\b",
         "gh auth token prints the literal access token; capture it via "
         "'!' prefix in your own shell instead.",
@@ -216,8 +227,55 @@ def _utc_now_iso() -> str:
     )
 
 
+_PATH_REDACT_RE = re.compile(
+    r"(?P<prefix>(?:cat|less|more|head|tail|bat|xxd|hexdump|od)\s+)"
+    r"(?P<path>[^\s|;&>]+)"
+)
+
+
+def _redact_for_log(cmd: str) -> str:
+    """Strip filesystem paths from secret-file reads before they hit the
+    audit log.
+
+    The audit log is intended to be inspectable, but the *path* of a
+    blocked credential file is itself sensitive (it leaks where you keep
+    your `.aws/credentials`, your home directory layout, etc.).  We
+    replace the argument of any read-style command with `<redacted>` and
+    keep the basename pattern only when it ends with a known credential
+    suffix, so the log still tells you *what kind of file* was blocked
+    without leaking *which one*.
+    """
+
+    def _sub(match: re.Match[str]) -> str:
+        path = match.group("path")
+        # Keep just the trailing extension/suffix that triggered the deny
+        # rule so the log still says "it was a .env" without saying
+        # "it was /home/<user>/projects/foo/.env".
+        for suffix in (
+            ".env", ".envrc", ".netrc", "credentials.json",
+            "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+            ".pem", ".p12", ".pfx",
+            "/.kube/config", "/.aws/credentials",
+            ".npmrc", ".pypirc", ".docker/config.json",
+            "secrets.yml", "secrets.yaml", ".git-credentials",
+            "hosts.yml", "hosts.yaml",
+        ):
+            if path.endswith(suffix):
+                return f"{match.group('prefix')}<redacted:{suffix}>"
+        return f"{match.group('prefix')}<redacted>"
+
+    return _PATH_REDACT_RE.sub(_sub, cmd)
+
+
 def log_event(kind: str, cmd: str, reason: str = "") -> None:
-    """Append one JSON line to the audit log; never raise."""
+    """Append one JSON line to the audit log; never raise.
+
+    The ``cmd`` field is path-redacted: if you blocked
+    ``cat /home/alice/.aws/credentials`` the log will record
+    ``cat <redacted:/.aws/credentials>``.  This prevents the audit trail
+    itself from leaking the layout of your filesystem if it gets
+    accidentally committed or shared.
+    """
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as fp:
@@ -226,7 +284,7 @@ def log_event(kind: str, cmd: str, reason: str = "") -> None:
                     {
                         "ts": _utc_now_iso(),
                         "kind": kind,
-                        "cmd": cmd,
+                        "cmd": _redact_for_log(cmd),
                         "reason": reason,
                         "version": VERSION,
                     },
