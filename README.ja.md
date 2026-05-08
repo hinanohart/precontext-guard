@@ -32,7 +32,7 @@
 ## 30 秒インストール
 
 ```bash
-git clone https://github.com/OWNER/precontext-guard.git
+git clone https://github.com/hinanohart/precontext-guard.git
 chmod +x precontext-guard/precontext-guard
 ```
 
