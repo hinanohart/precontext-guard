@@ -161,6 +161,39 @@ DENY_DEFAULT: list[tuple[str, str]] = [
         "curl|sh fetches and runs unverified remote code; review then run "
         "via '!' prefix instead.",
     ),
+    # PCG-CRIT-1 fix (2026-05-09 second-pass R17 audit) — generic pipe-to-shell.
+    # The curl|sh rule above only catches curl/wget/fetch as the producer.
+    # An attacker can launder unverified content through any other tool
+    # (cat / echo / base64 -d / xxd -r / openssl enc -d / printf) and pipe
+    # the output into a shell. We therefore deny *any* pipeline that ends
+    # in a shell interpreter, regardless of what produced the bytes.
+    (
+        r"\|\s*(?:sh|bash|zsh|fish|dash|ksh|ash|csh|tcsh)(?:\s|$)",
+        "Refusing to pipe arbitrary upstream output into a shell — that "
+        "executes attacker-controlled bytes regardless of their origin "
+        "(catches `cat`, `base64 -d`, `xxd -r`, `openssl enc -d`, etc., "
+        "which the `curl|sh` rule would have missed).",
+    ),
+    # PCG-CRIT-3 fix — xargs-mediated indirection. `echo .env | xargs cat`
+    # bypassed the cat-with-path-argument rule because xargs sits between
+    # the path and `cat`, so the rule's "cat <path>" adjacency check did
+    # not match. We now block the xargs form too.
+    (
+        r"\bxargs\s+(?:-[a-zA-Z0-9]+\s+)*"
+        r"(?:cat|less|more|head|tail|bat|xxd|hexdump|od|awk|sed)\b",
+        "xargs forwarding to a file-reading tool can leak any path piped "
+        "to it (e.g. `echo .env | xargs cat`); use the file directly with "
+        "the assistant or read it via '!' prefix.",
+    ),
+    # PCG-CRIT-3 fix — find -exec indirection. Same shape as xargs but the
+    # find runtime is the producer.
+    (
+        r"\bfind\b[^|;&]*-exec\s+"
+        r"(?:cat|less|more|head|tail|bat|xxd|hexdump|od|awk|sed)\b",
+        "find -exec forwarding to a file-reading tool can leak any path "
+        "matched by the find expression (e.g. "
+        "`find . -name .env -exec cat {} \\;`).",
+    ),
     (
         r"\bvault\s+(read|kv\s+get)\s+\S*(secret|kv|password)",
         "vault read returns the plaintext secret value.",
@@ -284,7 +317,15 @@ def log_event(kind: str, cmd: str, reason: str = "") -> None:
     would expose it to every other local user.
     """
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # PCG-CRIT-4 fix (2026-05-09 second-pass R17 audit) — atomic dir mode.
+        # Previously we did mkdir(...) then os.chmod(0o700). Under default
+        # umask 022 the directory existed at 0o755 for the µs window between
+        # those two calls, allowing a co-resident user to swap a symlink in
+        # under inotify. mkdir(mode=0o700) bypasses umask and creates the
+        # directory with the correct mode in a single syscall.
+        LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Belt-and-braces re-chmod for the case where the directory existed
+        # before our process started (mkdir(exist_ok=True) does not chmod).
         try:
             os.chmod(LOG_DIR, 0o700)
         except OSError:
