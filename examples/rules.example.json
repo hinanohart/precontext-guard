@@ -1,0 +1,18 @@
+{
+  "_comment": "Example external rule file. Point PCG_RULES_FILE at this to add allow/deny patterns on top of the defaults shipped in precontext-guard. Both 'allow' and 'deny' are evaluated *before* the built-in rules; allow wins ties; the first matching deny wins.",
+
+  "allow": [
+    "^\\s*my-internal-tool\\s+(list|status|version)(\\s|$)"
+  ],
+
+  "deny": [
+    {
+      "pattern": "\\bmy-internal-secret-tool\\s+(show|export)\\b",
+      "reason": "internal secret CLI prints credentials to stdout"
+    },
+    {
+      "pattern": "\\bmy-vault\\s+get\\b",
+      "reason": "in-house vault CLI prints plaintext on get"
+    }
+  ]
+}

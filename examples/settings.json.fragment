@@ -1,0 +1,24 @@
+// precontext-guard — Claude Code settings.json fragment
+//
+// Merge the "hooks" section below into your existing
+//   ~/.claude/settings.json   (user-wide)        OR
+//   <project>/.claude/settings.json   (project)
+//
+// The path "/path/to/precontext-guard" must point at the executable script
+// (the file in this repo named `precontext-guard`, made executable with
+// `chmod +x`).
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/precontext-guard"
+          }
+        ]
+      }
+    ]
+  }
+}
