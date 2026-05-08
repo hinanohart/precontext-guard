@@ -70,10 +70,12 @@ How to run it safely:
 ```bash
 git clone https://github.com/hinanohart/precontext-guard.git
 chmod +x precontext-guard/precontext-guard
-
-# Add to ~/.claude/settings.json (merge the snippet from
-# examples/settings.json.fragment into the existing file).
 ```
+
+Then merge the strict-JSON snippet from `examples/hooks.json` into
+your `~/.claude/settings.json`.  Step-by-step instructions, including
+a safe `jq` one-liner with backup and a dry-run, are in
+[examples/INSTALL.md](examples/INSTALL.md).
 
 Requirements: Python ≥ 3.10 (the standard library is enough — no `pip
 install` needed at runtime).
