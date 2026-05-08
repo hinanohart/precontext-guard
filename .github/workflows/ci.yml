@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install pytest
+        run: python -m pip install --upgrade pip && pip install pytest
+      - name: Run unit tests
+        run: python -m pytest tests/ -q
+      - name: Smoke test the hook entrypoint
+        shell: bash
+        run: |
+          chmod +x precontext-guard
+          # BLOCK case
+          set +e
+          out=$(echo '{"tool_name":"Bash","tool_input":{"command":"gh auth token"}}' \
+            | ./precontext-guard 2>&1)
+          rc=$?
+          set -e
+          [ "$rc" = "2" ] || { echo "expected rc=2 got $rc"; exit 1; }
+          echo "$out" | grep -q "BLOCKED" || { echo "missing BLOCKED in output"; exit 1; }
+          # ALLOW case
+          set +e
+          echo '{"tool_name":"Bash","tool_input":{"command":"gh pr list"}}' \
+            | ./precontext-guard
+          rc=$?
+          set -e
+          [ "$rc" = "0" ] || { echo "expected rc=0 got $rc"; exit 1; }
+          # Non-Bash defer
+          set +e
+          echo '{"tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}' \
+            | ./precontext-guard
+          rc=$?
+          set -e
+          [ "$rc" = "0" ] || { echo "expected rc=0 for non-Bash got $rc"; exit 1; }
+          echo "all smoke tests passed"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install linters
+        run: python -m pip install --upgrade pip && pip install ruff mypy
+      - name: ruff
+        run: ruff check precontext-guard tests/
+      - name: mypy (lenient — single-file hook)
+        run: mypy --ignore-missing-imports --allow-untyped-defs precontext-guard tests/
+
+  leak-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit for unintended user-specific identifiers
+        shell: bash
+        run: |
+          # The repo must never contain references to specific people, hosts,
+          # private services, or local filesystem layouts.  Such strings
+          # would only ever appear by accident; if you have a legitimate
+          # need to mention one, redact it.
+          #
+          # The forbidden pattern is stored base64-encoded so this audit
+          # script does not itself contain the literals it forbids.
+          set -e
+          PATTERN_B64='KFxic3ZbMC05XXs0LDZ9XGJ8XGJ4c1swLTldezYsfVxifC9tbnQvYy9Vc2Vycy98MTkyXC4xNjhcLlswLTldK1wuWzAtOV0rKQ=='
+          PATTERN=$(printf '%s' "$PATTERN_B64" | base64 -d)
+          if grep -rEn "$PATTERN" --exclude-dir=.git . ; then
+            echo "Audit failed: a likely user-specific identifier was found."
+            exit 1
+          fi
+          echo "leak audit clean"

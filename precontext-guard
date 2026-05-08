@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""precontext-guard — block CLI commands that would leak secrets into the
+assistant's context window before they ever execute.
+
+This is a Claude Code PreToolUse hook.  Anthropic's runtime feeds the hook a
+JSON document on stdin describing the impending tool call; if we exit with
+status 2 the call is blocked and our stderr message is shown to the model.
+
+The guard is *pre-context*: it stops commands like ``gh auth token`` or
+``cat .env`` *before* they run, so the literal secret never lands in the
+chat transcript, the model's request payload, or the provider's logs.
+
+License: Apache-2.0
+Project: https://github.com/<owner>/precontext-guard
+"""
+
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Iterable
+
+VERSION = "0.1.0"
+
+# ---------------------------------------------------------------------------
+# Locations
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STATE = Path(
+    os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+)
+LOG_DIR = Path(os.environ.get("PCG_LOG_DIR", _DEFAULT_STATE / "precontext-guard"))
+LOG_FILE = LOG_DIR / "audit.jsonl"
+
+# ---------------------------------------------------------------------------
+# Default allow list — first hit wins, evaluated before deny patterns.
+#
+# These are the safe shapes we expect to see in agentic workflows.  They are
+# deliberately narrow: ``gh auth status`` is fine because it only prints
+# whether you are logged in, but ``gh auth token`` (which prints the token
+# itself) is *not* listed here and falls through to the deny stage.
+# ---------------------------------------------------------------------------
+
+ALLOW_DEFAULT: list[str] = [
+    r"^\s*gh\s+(pr|issue|repo|run|api|workflow|release|browse|search|gist|"
+    r"cache|attestation|extension|label|project|status|codespace|ruleset)"
+    r"(\s|$)",
+    r"^\s*gh\s+auth\s+(status|logout|switch|setup-git|refresh)(\s|$)",
+    r"^\s*git\s+(push|pull|fetch|status|log|diff|commit|add|stash|checkout|"
+    r"branch|merge|rebase|tag|show|init|clone|remote|reset|restore|reflog|"
+    r"describe|grep|ls-files|cat-file|rev-parse|worktree|cherry-pick|bisect|"
+    r"submodule|blame|apply|mv|rm)(\s|$)",
+    r"^\s*npm\s+(publish|install|i|run|test|ci|view|outdated|dedup|ls|init|"
+    r"version|whoami|ping|search|update|prune|audit|exec|link|unlink)(\s|$)",
+    r"^\s*(yarn|pnpm)\s+(install|i|test|run|ci|add|remove|outdated|why|"
+    r"workspace|exec|dlx)(\s|$)",
+    r"^\s*npx\s+\S",
+    r"^\s*pip3?\s+(install|list|show|freeze|uninstall|search|check|wheel|"
+    r"download|index)(\s|$)",
+    r"^\s*pipx\s+(install|run|list|upgrade|uninstall|inject|reinstall|"
+    r"runpip)(\s|$)",
+    r"^\s*cargo\s+(build|run|test|fmt|check|clippy|publish|install|new|init|"
+    r"update|doc|bench|tree|search)(\s|$)",
+    r"^\s*go\s+(build|run|test|fmt|vet|mod|install|get|generate|tool|doc|"
+    r"fix|version|env)(\s|$)",
+    r"^\s*docker\s+(build|run|ps|images|logs|exec|stop|start|rm|rmi|pull|"
+    r"push|tag|inspect|version|info|compose|network|volume|stats|cp|"
+    r"history|save|load|commit|kill|pause|unpause|rename|restart|top|wait)"
+    r"(\s|$)",
+    r"^\s*kubectl\s+(get|describe|apply|delete|logs|exec|port-forward|run|"
+    r"create|edit|patch|rollout|scale|version|cluster-info|top|wait|cp|"
+    r"explain|api-resources|api-versions|annotate|label|drain|cordon|"
+    r"uncordon|auth|set|expose)(\s|$)",
+    r"^\s*ls(\s|$)",
+    r"^\s*pwd\s*$",
+]
+
+# ---------------------------------------------------------------------------
+# Default deny list — first hit wins, evaluated after the allow stage.
+# Each entry is (pattern, human-readable reason).
+# ---------------------------------------------------------------------------
+
+DENY_DEFAULT: list[tuple[str, str]] = [
+    (
+        r"\bgh\s+auth\s+(token|login\s+--with-token)\b",
+        "gh auth token prints the literal access token; capture it via "
+        "'!' prefix in your own shell instead.",
+    ),
+    (
+        r"\bgit\s+config\s+.*credential\.helper\s*=?\s*store\b",
+        "git credential.helper=store would persist plaintext credentials.",
+    ),
+    (
+        r"\baws\s+configure(\s|$)",
+        "aws configure prompts for a session secret; run via '!' prefix only.",
+    ),
+    (
+        r"\baws\s+sts\s+get-session-token\b",
+        "aws sts get-session-token returns a credential payload; never read "
+        "its output via the assistant.",
+    ),
+    (
+        r"\bgcloud\s+auth\s+(print-access-token|print-identity-token|"
+        r"print-refresh-token)\b",
+        "gcloud print-*-token returns a bearer token literal; capture in "
+        "your shell.",
+    ),
+    (
+        r"\bkubectl\s+config\s+view\s+(--raw\b|.*--minify.*--raw\b)",
+        "kubectl config view --raw embeds plaintext credentials.",
+    ),
+    (
+        r"\bdocker\s+login\s+(-p|--password)(\s|=)",
+        "docker login -p exposes the password literal; use stdin or "
+        "'!' prefix.",
+    ),
+    (
+        r"\b(cat|less|more|head|tail|bat|xxd|hexdump|od)\s+[^|;&]*"
+        r"(\.env(\s|$|\.|/)|\.envrc|\.netrc|credentials\.json|"
+        r"hosts\.ya?ml|id_(rsa|ed25519|ecdsa|dsa)|\.pem(\s|$)|\.p12|\.pfx|"
+        r"\.kube/config|secrets\.ya?ml|\.aws/credentials|\.npmrc|\.pypirc|"
+        r"\.git-credentials|\.docker/config\.json)",
+        "Reading a credential file leaks its entire content into the "
+        "assistant context.",
+    ),
+    (
+        r"^\s*(printenv|env)\s*$",
+        "printenv / bare env dump leaks every environment variable, "
+        "including secrets.",
+    ),
+    (
+        r"\becho\s+[\"']?\$\{?[A-Za-z_]*"
+        r"(TOKEN|KEY|SECRET|PASSWORD|API_?KEY|ACCESS|CREDENTIAL|PASSWD)",
+        "echo of a $*TOKEN/KEY/SECRET variable prints its value into the "
+        "context.",
+    ),
+    (
+        r"\bprintf\s+[\"'][^\"']*\"?%s[^\"']*[\"']\s+\"?\$\{?[A-Za-z_]*"
+        r"(TOKEN|KEY|SECRET|PASSWORD|API_?KEY|ACCESS|CREDENTIAL)",
+        "printf of a $*TOKEN/KEY/SECRET variable prints its value into "
+        "the context.",
+    ),
+    (
+        r"\b(curl|wget|fetch)\s+[^|]*\|\s*(sh|bash|python3?|zsh|fish|node|"
+        r"perl|ruby)\b",
+        "curl|sh fetches and runs unverified remote code; review then run "
+        "via '!' prefix instead.",
+    ),
+    (
+        r"\bvault\s+(read|kv\s+get)\s+\S*(secret|kv|password)",
+        "vault read returns the plaintext secret value.",
+    ),
+    (
+        r"\bop\s+(read|item\s+get)[^|]*--reveal\b",
+        "1Password 'op --reveal' prints the secret literal.",
+    ),
+    (
+        r"\bdoppler\s+secrets\s+(get|download)\b",
+        "Doppler secrets get/download prints or writes plaintext secrets.",
+    ),
+    (
+        r"\bbw\s+(get\s+(password|item|totp)|export)\b",
+        "Bitwarden 'bw get password' / 'bw export' prints or writes the "
+        "secret literal.",
+    ),
+    (
+        r"\bsops\s+(-d\b|--decrypt\b)",
+        "sops --decrypt prints the plaintext secret to stdout.",
+    ),
+    (
+        r"\bpass\s+(show|-c)?\s+\S",
+        "pass(1) show prints the stored secret to stdout.",
+    ),
+    (
+        r"\bsecret-tool\s+lookup\b",
+        "secret-tool lookup returns the secret value to stdout.",
+    ),
+    (
+        r"\bkeyring\s+get\b",
+        "Python keyring 'get' prints the secret value.",
+    ),
+    (
+        r"\bgpg\s+(-d|--decrypt)\b",
+        "gpg --decrypt streams the cleartext to stdout.",
+    ),
+    (
+        r"\bopenssl\s+(rsa|ec|pkey|enc)\s+(-in|.*-passin\s+pass:)",
+        "openssl with a private key or '-passin pass:<literal>' echoes the "
+        "secret material.",
+    ),
+    (
+        r"\b(history|fc\s+-l)\b",
+        "Shell history can contain previously-entered secrets.",
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp, Python 3.10+ compatible."""
+    if hasattr(_dt, "UTC"):  # Python 3.11+
+        return _dt.datetime.now(_dt.UTC).isoformat().replace("+00:00", "Z")
+    return (
+        _dt.datetime.utcnow()
+        .replace(tzinfo=_dt.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def log_event(kind: str, cmd: str, reason: str = "") -> None:
+    """Append one JSON line to the audit log; never raise."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as fp:
+            fp.write(
+                json.dumps(
+                    {
+                        "ts": _utc_now_iso(),
+                        "kind": kind,
+                        "cmd": cmd,
+                        "reason": reason,
+                        "version": VERSION,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except OSError:
+        # Logging is best-effort — never fail a hook because of it.
+        pass
+
+
+def emit_block(cmd: str, reason: str) -> None:
+    binary = cmd.strip().split(maxsplit=1)[0] if cmd.strip() else "<command>"
+    msg = (
+        f"[precontext-guard] BLOCKED — {reason}\n"
+        "\n"
+        "The literal value this command would print could enter the assistant's\n"
+        "context window (and from there: chat logs, the model provider's servers,\n"
+        "and any attached tooling).  precontext-guard refuses to forward such\n"
+        "commands.\n"
+        "\n"
+        "How to run it safely:\n"
+        "  - From your own shell directly: prefix the command with '!' so it runs\n"
+        "    locally and its output never reaches the assistant.\n"
+        f"        e.g.  ! {binary} ...\n"
+        "  - Or capture into an environment variable first, then have the\n"
+        "    assistant use that variable by name (without ever reading its\n"
+        "    value):\n"
+        "        ! read -rs MY_TOKEN; export MY_TOKEN\n"
+        "        # in chat afterwards:  invoke as $MY_TOKEN\n"
+        "\n"
+        "To override (advanced — on your own responsibility):\n"
+        "  PCG_OVERRIDE=1 <command>           one-shot bypass\n"
+        "  PCG_RULES_FILE=/path/rules.json    custom allow/deny set\n"
+        "\n"
+        f"precontext-guard {VERSION}\n"
+    )
+    sys.stderr.write(msg)
+
+
+def _compile(patterns: Iterable[str]) -> list[re.Pattern[str]]:
+    out: list[re.Pattern[str]] = []
+    for pat in patterns:
+        try:
+            out.append(re.compile(pat))
+        except re.error:
+            # A bad user-supplied pattern should not crash the guard; log and
+            # skip it.
+            log_event("rule-error", pat, "invalid regex; skipped")
+    return out
+
+
+def load_external_rules(
+    path: str,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Load extra allow/deny rules from a JSON file.
+
+    Schema::
+
+        {
+          "allow": ["regex", ...],
+          "deny":  [{"pattern": "regex", "reason": "..."}, ...]
+        }
+    """
+    try:
+        with open(path, encoding="utf-8") as fp:
+            doc = json.load(fp)
+    except (OSError, json.JSONDecodeError) as exc:
+        log_event("rules-error", path, f"could not load: {exc!r}")
+        return [], []
+
+    allow = [p for p in doc.get("allow", []) if isinstance(p, str)]
+    deny: list[tuple[str, str]] = []
+    for entry in doc.get("deny", []):
+        if isinstance(entry, dict) and isinstance(entry.get("pattern"), str):
+            deny.append(
+                (entry["pattern"], str(entry.get("reason", "Custom deny")))
+            )
+    return allow, deny
+
+
+def decide(cmd: str) -> tuple[str, str]:
+    """Return (verdict, reason). verdict in {"allow", "block"}."""
+    allow_extra: list[str] = []
+    deny_extra: list[tuple[str, str]] = []
+    rules_path = os.environ.get("PCG_RULES_FILE")
+    if rules_path and os.path.isfile(rules_path):
+        allow_extra, deny_extra = load_external_rules(rules_path)
+
+    for pat in _compile([*allow_extra, *ALLOW_DEFAULT]):
+        if pat.search(cmd):
+            return "allow", f"matched allow: {pat.pattern}"
+
+    for pat_str, reason in [*deny_extra, *DENY_DEFAULT]:
+        try:
+            if re.search(pat_str, cmd):
+                return "block", reason
+        except re.error:
+            log_event("rule-error", pat_str, "invalid regex; skipped")
+            continue
+
+    return "allow", "no rule hit (gray)"
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] in ("-V", "--version"):
+        print(f"precontext-guard {VERSION}")
+        return 0
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    if sys.stdin.isatty():
+        # No JSON piped in — defer.
+        return 0
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return 0
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        log_event("skip-not-json", raw[:200], "stdin was not valid JSON")
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+
+    if payload.get("tool_name") != "Bash":
+        return 0
+
+    tool_input = payload.get("tool_input") or {}
+    cmd = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return 0
+
+    if os.environ.get("PCG_OVERRIDE") == "1":
+        log_event("override", cmd, "PCG_OVERRIDE=1")
+        return 0
+
+    verdict, reason = decide(cmd)
+    if verdict == "block":
+        log_event("block", cmd, reason)
+        emit_block(cmd, reason)
+        return 2
+
+    log_event("allow", cmd, reason)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
