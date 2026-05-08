@@ -3,7 +3,7 @@
 > Block CLI commands that would leak secrets into your AI assistant's
 > context window — *before* they run.
 
-[![ci](https://github.com/OWNER/precontext-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/precontext-guard/actions/workflows/ci.yml)
+[![ci](https://github.com/hinanohart/precontext-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/hinanohart/precontext-guard/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
 `precontext-guard` is a single-file [Claude Code](https://docs.anthropic.com/claude-code)
@@ -68,7 +68,7 @@ How to run it safely:
 ## 30-second install
 
 ```bash
-git clone https://github.com/OWNER/precontext-guard.git
+git clone https://github.com/hinanohart/precontext-guard.git
 chmod +x precontext-guard/precontext-guard
 
 # Add to ~/.claude/settings.json (merge the snippet from
