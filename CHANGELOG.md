@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Replaced the previous JSONC `examples/settings.json.fragment` (which
+  contained `//` comments) with a strict-JSON `examples/hooks.json`.
+  Pasting the old fragment verbatim into `~/.claude/settings.json`
+  would have corrupted that file; the new example round-trips through
+  `json.load` cleanly.
+
+### Added
+- `examples/INSTALL.md` walks the reader through both a manual merge
+  and an idempotent `jq` one-liner with a timestamped backup and a
+  dry-run step.
+- Six new tests in `tests/test_examples.py` enforce strict JSON in
+  `examples/`, exercise the documented `jq` merge for idempotency, and
+  guard against future JSONC regressions.
+
+### Removed
+- `examples/settings.json.fragment` (replaced by `examples/hooks.json`).
+
 ## [0.1.0] - 2026-05-08
 
 ### Added

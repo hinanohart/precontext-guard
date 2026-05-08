@@ -36,8 +36,15 @@ git clone https://github.com/hinanohart/precontext-guard.git
 chmod +x precontext-guard/precontext-guard
 ```
 
-`~/.claude/settings.json` に
-`examples/settings.json.fragment` の内容をマージしてください。
+その後、`examples/hooks.json` (strict JSON) のスニペットを
+`~/.claude/settings.json` にマージしてください。
+
+⚠️ `settings.json` は strict JSON (コメント・末尾カンマ不可) なので、
+コメント付きの設定例をそのまま貼り付けると `settings.json` が壊れます。
+v0.1.0 以降の `examples/hooks.json` は純粋な JSON に修正済みです。
+
+`jq` を使った安全なマージ手順 (バックアップ + dry-run 付き) は
+[examples/INSTALL.md](examples/INSTALL.md) に記載しています。
 
 実行時依存はありません (Python 3.10 以降の標準ライブラリのみ)。
 
