@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (2026-05-09 follow-up audit — fail-secure on rules-file errors)
+
+- **`PCG_RULES_FILE` failure now blocks (BREAKING).** When the env var
+  is configured but the file cannot be opened (`OSError`: removed,
+  permissions flipped, race) or contains invalid JSON, the decider
+  used to silently fall back to an empty extra-rule set. That is
+  fail-open: an attacker who can briefly perturb the rules file
+  strips the user's custom deny entries and leaves only
+  `DENY_DEFAULT` to catch them. The decider now returns
+  `("block", "PCG_RULES_FILE configured but unreadable/invalid …")`
+  and emits a `rules-error` log event. Users who relied on the old
+  silent-skip behaviour must either unset `PCG_RULES_FILE` or
+  guarantee the file is always readable. The TOCTOU-prone
+  `os.path.isfile` pre-check has been removed in favour of trusting
+  the `open()` path.
+
 ### Security (2026-05-09 R17 audit — three CRITICAL classes patched)
 
 - **Chained-command bypass closed (CRITICAL #1).** Previously a command
