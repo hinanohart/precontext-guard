@@ -1,5 +1,7 @@
 # precontext-guard
 
+> **Disclaimer:** This is an **independent third-party tool**. It is **not affiliated with, endorsed by, or sponsored by Anthropic**. "Claude" and "Claude Code" are trademarks of Anthropic and are used here nominatively to identify the official CLI/product this tool integrates with.
+
 > Block CLI commands that would leak secrets into your AI assistant's
 > context window — *before* they run.
 
