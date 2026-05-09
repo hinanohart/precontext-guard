@@ -238,10 +238,53 @@ def test_malformed_external_pattern_does_not_crash(
     assert verdict == "allow"
 
 
-def test_missing_external_rules_file_is_ignored(monkeypatch) -> None:
+def test_missing_external_rules_file_is_blocked(monkeypatch) -> None:
+    """PCG_RULES_FILE configured but missing -> fail-secure block.
+
+    Previously this returned ``allow`` (silent skip). That is fail-open:
+    an attacker who could remove or chmod 000 the rules file would
+    strip the user's custom deny entries and only DENY_DEFAULT would
+    remain. fail-secure: when the rules file is configured-but-broken
+    we refuse the command and emit a rules-error event.
+    """
     monkeypatch.setenv("PCG_RULES_FILE", "/nonexistent/file.json")
-    verdict, _reason = pg.decide("ls /tmp")
-    assert verdict == "allow"
+    verdict, reason = pg.decide("ls /tmp")
+    assert verdict == "block"
+    assert "PCG_RULES_FILE" in reason
+
+
+def test_invalid_json_rules_file_is_blocked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Malformed JSON -> fail-secure block, not silent skip."""
+    rules = tmp_path / "broken.json"
+    rules.write_text("{ this is not valid json")
+    monkeypatch.setenv("PCG_RULES_FILE", str(rules))
+    verdict, reason = pg.decide("ls /tmp")
+    assert verdict == "block"
+    assert "PCG_RULES_FILE" in reason
+
+
+def test_unreadable_rules_file_is_blocked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """File exists but mode 000 -> OSError -> fail-secure block."""
+    import os as _os
+
+    rules = tmp_path / "rules.json"
+    rules.write_text(json.dumps({"allow": [], "deny": []}))
+    _os.chmod(rules, 0)
+    try:
+        if _os.access(rules, _os.R_OK):
+            import pytest
+
+            pytest.skip("running as root: chmod 000 still readable")
+        monkeypatch.setenv("PCG_RULES_FILE", str(rules))
+        verdict, reason = pg.decide("ls /tmp")
+        assert verdict == "block"
+        assert "PCG_RULES_FILE" in reason
+    finally:
+        _os.chmod(rules, 0o600)
 
 
 # ---------- entry-point integration ---------------------------------------

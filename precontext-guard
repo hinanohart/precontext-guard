@@ -408,13 +408,17 @@ def load_external_rules(
           "allow": ["regex", ...],
           "deny":  [{"pattern": "regex", "reason": "..."}, ...]
         }
+
+    Raises ``OSError`` when the file cannot be opened/read and
+    ``json.JSONDecodeError`` when the contents are not valid JSON.
+    Callers must surface these as a fail-secure block: silently
+    falling back to an empty rule set would let an attacker who can
+    make the configured rules file unreadable strip the user's
+    custom deny rules and slip through with only DENY_DEFAULT
+    catching them.
     """
-    try:
-        with open(path, encoding="utf-8") as fp:
-            doc = json.load(fp)
-    except (OSError, json.JSONDecodeError) as exc:
-        log_event("rules-error", path, f"could not load: {exc!r}")
-        return [], []
+    with open(path, encoding="utf-8") as fp:
+        doc = json.load(fp)
 
     allow = [p for p in doc.get("allow", []) if isinstance(p, str)]
     deny: list[tuple[str, str]] = []
@@ -575,8 +579,26 @@ def decide(cmd: str) -> tuple[str, str]:
     allow_extra: list[str] = []
     deny_extra: list[tuple[str, str]] = []
     rules_path = os.environ.get("PCG_RULES_FILE")
-    if rules_path and os.path.isfile(rules_path):
-        allow_extra, deny_extra = load_external_rules(rules_path)
+    if rules_path:
+        # Fail-secure: if the user wired up PCG_RULES_FILE we treat it
+        # as load-bearing. Silently dropping the extra deny rules on
+        # OSError (file removed, perm-flipped, race) or invalid JSON
+        # would let an attacker who can briefly perturb the file slip
+        # past the user's custom deny set. Block the command and emit
+        # a rules-error event instead.
+        try:
+            allow_extra, deny_extra = load_external_rules(rules_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            log_event(
+                "rules-error",
+                rules_path,
+                f"unreadable/invalid; fail-secure block: {exc!r}",
+            )
+            return (
+                "block",
+                "PCG_RULES_FILE configured but unreadable/invalid "
+                "(fail-secure)",
+            )
 
     allow_pats = _compile([*allow_extra, *ALLOW_DEFAULT])
     deny_pats: list[tuple[str, str]] = [*deny_extra, *DENY_DEFAULT]
