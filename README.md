@@ -6,7 +6,7 @@
 > context window — *before* they run.
 
 [![ci](https://github.com/hinanohart/precontext-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/hinanohart/precontext-guard/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 `precontext-guard` is a single-file [Claude Code](https://docs.anthropic.com/claude-code)
 `PreToolUse` hook.  When the assistant is about to run a shell command, the
@@ -234,4 +234,4 @@ When proposing a new pattern, please:
 
 ## License
 
-[Apache-2.0](LICENSE).
+[MIT](LICENSE).
