@@ -8,7 +8,7 @@ These tests guarantee that
   * the merge procedure documented in examples/INSTALL.md, when
     executed, produces a result that still parses as strict JSON.
 
-License: Apache-2.0
+License: MIT
 """
 
 from __future__ import annotations
