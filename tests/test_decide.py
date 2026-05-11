@@ -5,7 +5,7 @@ the golden-file harness in tests/test_golden.py.  Here we focus on the
 properties of ``decide()``: order-independent allow precedence, deny
 specificity, malformed-pattern resilience, and external rule overrides.
 
-License: Apache-2.0
+License: MIT
 """
 
 from __future__ import annotations
