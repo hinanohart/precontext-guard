@@ -1,0 +1,4 @@
+
+# 2026-05-16 audit: Semgrep false-positive 除外
+# 動機: CLI entrypoint の 0o700 permission は隔離設計上 intentional
+precontext-guard
