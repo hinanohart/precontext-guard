@@ -6,7 +6,7 @@
 > context window — *before* they run.
 
 [![ci](https://github.com/hinanohart/precontext-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/hinanohart/precontext-guard/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `precontext-guard` is a single-file [Claude Code](https://docs.anthropic.com/claude-code)
 `PreToolUse` hook.  When the assistant is about to run a shell command, the
